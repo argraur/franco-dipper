@@ -155,6 +155,7 @@ struct spi_geni_master {
 	int num_xfers;
 	void *ipc;
 	bool shared_se;
+	bool dis_autosuspend;
 };
 
 static struct spi_master *get_spi_master(struct device *dev)
@@ -355,9 +356,6 @@ static struct msm_gpi_tre *setup_config0_tre(struct spi_transfer *xfer,
 
 	if (mode & SPI_CPHA)
 		flags |= GSI_CPHA;
-
-	if (xfer->cs_change)
-		flags |= GSI_CS_TOGGLE;
 
 	word_len = xfer->bits_per_word - MIN_WORD_LEN;
 	pack |= (GSI_TX_PACK_EN | GSI_RX_PACK_EN);
@@ -586,8 +584,11 @@ static int setup_gsi_xfer(struct spi_transfer *xfer,
 	}
 
 	cs |= spi_slv->chip_select;
-	if (!list_is_last(&xfer->transfer_list, &spi->cur_msg->transfers))
-		go_flags |= FRAGMENTATION;
+	if (!xfer->cs_change) {
+		if (!list_is_last(&xfer->transfer_list,
+					&spi->cur_msg->transfers))
+			go_flags |= FRAGMENTATION;
+	}
 	go_tre = setup_go_tre(cmd, cs, rx_len, go_flags, mas);
 
 	sg_init_table(xfer_tx_sg, tx_nent);
@@ -752,7 +753,7 @@ static int spi_geni_unprepare_message(struct spi_master *spi_mas,
 static int spi_geni_prepare_transfer_hardware(struct spi_master *spi)
 {
 	struct spi_geni_master *mas = spi_master_get_devdata(spi);
-	int ret = 0;
+	int ret = 0, count = 0;
 	u32 max_speed = spi->cur_msg->spi->max_speed_hz;
 	struct se_geni_rsc *rsc = &mas->spi_rsc;
 
@@ -779,7 +780,12 @@ static int spi_geni_prepare_transfer_hardware(struct spi_master *spi)
 	} else {
 		ret = 0;
 	}
-
+	if (mas->dis_autosuspend) {
+		count = atomic_read(&mas->dev->power.usage_count);
+		if (count <= 0)
+			GENI_SE_ERR(mas->ipc, false, NULL,
+				"resume usage count mismatch:%d", count);
+	}
 	if (unlikely(!mas->setup)) {
 		int proto = get_se_proto(mas->base);
 		unsigned int major;
@@ -868,7 +874,12 @@ setup_ipc:
 		mas->shared_se =
 			(geni_read_reg(mas->base, GENI_IF_FIFO_DISABLE_RO) &
 							FIFO_IF_DISABLE);
+		if (mas->dis_autosuspend)
+			GENI_SE_DBG(mas->ipc, false, mas->dev,
+					"Auto Suspend is disabled\n");
 	}
+	if (mas->dis_autosuspend)
+		dmaengine_resume(mas->tx);
 exit_prepare_transfer_hardware:
 	return ret;
 }
@@ -876,7 +887,7 @@ exit_prepare_transfer_hardware:
 static int spi_geni_unprepare_transfer_hardware(struct spi_master *spi)
 {
 	struct spi_geni_master *mas = spi_master_get_devdata(spi);
-
+	int count = 0;
 	if (mas->shared_se) {
 		struct se_geni_rsc *rsc;
 		int ret = 0;
@@ -889,8 +900,17 @@ static int spi_geni_unprepare_transfer_hardware(struct spi_master *spi)
 			"%s: Error %d pinctrl_select_state\n", __func__, ret);
 	}
 
-	pm_runtime_mark_last_busy(mas->dev);
-	pm_runtime_put_autosuspend(mas->dev);
+	if (mas->dis_autosuspend) {
+		dmaengine_pause(mas->tx);
+		pm_runtime_put_sync(mas->dev);
+		count = atomic_read(&mas->dev->power.usage_count);
+		if (count < 0)
+			GENI_SE_ERR(mas->ipc, false, NULL,
+				"suspend usage count mismatch:%d", count);
+	} else {
+		pm_runtime_mark_last_busy(mas->dev);
+		pm_runtime_put_autosuspend(mas->dev);
+	}
 	return 0;
 }
 
@@ -939,8 +959,6 @@ static void setup_fifo_xfer(struct spi_transfer *xfer,
 		m_cmd = SPI_RX_ONLY;
 
 	spi_tx_cfg &= ~CS_TOGGLE;
-	if (xfer->cs_change)
-		spi_tx_cfg |= CS_TOGGLE;
 	if (!(mas->cur_word_len % MIN_WORD_LEN)) {
 		trans_len =
 			((xfer->len << 3) / mas->cur_word_len) & TRANS_LEN_MSK;
@@ -949,8 +967,12 @@ static void setup_fifo_xfer(struct spi_transfer *xfer,
 
 		trans_len = (xfer->len / bytes_per_word) & TRANS_LEN_MSK;
 	}
-	if (!list_is_last(&xfer->transfer_list, &spi->cur_msg->transfers))
-		m_param |= FRAGMENTATION;
+
+	if (!xfer->cs_change) {
+		if (!list_is_last(&xfer->transfer_list,
+					&spi->cur_msg->transfers))
+			m_param |= FRAGMENTATION;
+	}
 
 	mas->cur_xfer = xfer;
 	if (m_cmd & SPI_TX_ONLY) {
@@ -965,8 +987,9 @@ static void setup_fifo_xfer(struct spi_transfer *xfer,
 	geni_write_reg(spi_tx_cfg, mas->base, SE_SPI_TRANS_CFG);
 	geni_setup_m_cmd(mas->base, m_cmd, m_param);
 	GENI_SE_DBG(mas->ipc, false, mas->dev,
-		"%s: trans_len %d xferlen%d tx_cfg 0x%x cmd 0x%x\n",
-		__func__, trans_len, xfer->len, spi_tx_cfg, m_cmd);
+		"%s: trans_len %d xferlen%d tx_cfg 0x%x cmd 0x%x cs %d\n",
+		__func__, trans_len, xfer->len, spi_tx_cfg, m_cmd,
+		xfer->cs_change);
 	if (m_cmd & SPI_TX_ONLY)
 		geni_write_reg(mas->tx_wm, mas->base, SE_GENI_TX_WATERMARK_REG);
 	/* Ensure all writes are done before the WM interrupt */
@@ -1324,7 +1347,9 @@ static int spi_geni_probe(struct platform_device *pdev)
 	rt_pri = of_property_read_bool(pdev->dev.of_node, "qcom,rt");
 	if (rt_pri)
 		spi->rt = true;
-
+	geni_mas->dis_autosuspend =
+		of_property_read_bool(pdev->dev.of_node,
+				"qcom,disable-autosuspend");
 	geni_mas->phys_addr = res->start;
 	geni_mas->size = resource_size(res);
 	geni_mas->base = devm_ioremap(&pdev->dev, res->start,
@@ -1364,8 +1389,11 @@ static int spi_geni_probe(struct platform_device *pdev)
 	init_completion(&geni_mas->tx_cb);
 	init_completion(&geni_mas->rx_cb);
 	pm_runtime_set_suspended(&pdev->dev);
-	pm_runtime_set_autosuspend_delay(&pdev->dev, SPI_AUTO_SUSPEND_DELAY);
-	pm_runtime_use_autosuspend(&pdev->dev);
+	if (!geni_mas->dis_autosuspend) {
+		pm_runtime_set_autosuspend_delay(&pdev->dev,
+					SPI_AUTO_SUSPEND_DELAY);
+		pm_runtime_use_autosuspend(&pdev->dev);
+	}
 	pm_runtime_enable(&pdev->dev);
 	ret = spi_register_master(spi);
 	if (ret) {
