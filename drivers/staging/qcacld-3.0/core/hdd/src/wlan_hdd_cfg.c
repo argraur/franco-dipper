@@ -4743,6 +4743,13 @@ struct reg_table_entry g_registry_table[] = {
 		CFG_5G_MAX_RSSI_PENALIZE_MAX),
 
 	REG_VARIABLE(CFG_ENABLE_PACKET_FILTERS_NAME, WLAN_PARAM_Integer,
+		struct hdd_config, packet_filters_bitmap_noop,
+		VAR_FLAGS_OPTIONAL | VAR_FLAGS_RANGE_CHECK_ASSUME_DEFAULT,
+		CFG_ENABLE_PACKET_FILTERS_DEFAULT,
+		CFG_ENABLE_PACKET_FILTERS_MIN,
+		CFG_ENABLE_PACKET_FILTERS_MAX),
+
+	REG_VARIABLE(CFG_ENABLE_PACKET_FILTERS_NAME_NOOP, WLAN_PARAM_Integer,
 		struct hdd_config, packet_filters_bitmap,
 		VAR_FLAGS_OPTIONAL | VAR_FLAGS_RANGE_CHECK_ASSUME_DEFAULT,
 		CFG_ENABLE_PACKET_FILTERS_DEFAULT,
@@ -6007,12 +6014,13 @@ static int parse_hex_digit(char c)
  *
  * Return: None
  */
-static void update_mac_from_string(hdd_context_t *pHddCtx,
-				   tCfgIniEntry *macTable, int num)
+static QDF_STATUS update_mac_from_string(hdd_context_t *pHddCtx,
+					 tCfgIniEntry *macTable, int num)
 {
 	int i = 0, j = 0, res = 0;
 	char *candidate = NULL;
 	struct qdf_mac_addr macaddr[QDF_MAX_CONCURRENCY_PERSONA];
+	QDF_STATUS status = QDF_STATUS_SUCCESS;
 
 	memset(macaddr, 0, sizeof(macaddr));
 
@@ -6030,8 +6038,12 @@ static void update_mac_from_string(hdd_context_t *pHddCtx,
 				     provisioned_mac_addr[i].bytes[0],
 				     (uint8_t *) &macaddr[i].bytes[0],
 				     QDF_MAC_ADDR_SIZE);
+		} else {
+			status = QDF_STATUS_E_FAILURE;
+			break;
 		}
 	}
+	return status;
 }
 
 /**
@@ -7859,7 +7871,7 @@ QDF_STATUS hdd_update_mac_config(hdd_context_t *pHddCtx)
 		buffer = line;
 	}
 
-	if (i <= QDF_MAX_CONCURRENCY_PERSONA) {
+	if (i != 0 && i <= QDF_MAX_CONCURRENCY_PERSONA) {
 		hdd_debug("%d Mac addresses provided", i);
 	} else {
 		hdd_err("invalid number of Mac address provided, nMac = %d", i);
@@ -7867,7 +7879,11 @@ QDF_STATUS hdd_update_mac_config(hdd_context_t *pHddCtx)
 		goto config_exit;
 	}
 
-	update_mac_from_string(pHddCtx, &macTable[0], i);
+	qdf_status = update_mac_from_string(pHddCtx, &macTable[0], i);
+	if (QDF_IS_STATUS_ERROR(qdf_status)) {
+		hdd_err("Invalid MAC addresses provided");
+		goto config_exit;
+	}
 	pHddCtx->num_provisioned_addr = i;
 	hdd_debug("Populating remaining %d Mac addreses",
 		   max_mac_addr - i);
